@@ -21,7 +21,7 @@
 // This package is designed to have few opinions and be a starting point for how you want to do errors in your project.
 // The main requirement is to satisfy the ErrorCode interface by attaching a Code to an Error.
 // See the documentation of ErrorCode.
-// Additional optional interfaces HasClientData and HasOperation are provided for extensibility
+// Additional optional interfaces HasClientData, HasOperation, HasError, and StackTracer are provided for extensibility
 // in creating structured error data representations.
 //
 // Hierarchies are supported: a Code can point to a parent.
@@ -31,16 +31,20 @@
 // A few generic top-level error codes are provided here.
 // You are encouraged to create your own application customized error codes rather than just using generic errors.
 //
-// See JSONFormat for an opinion on how to send back meta data about errors with the error data to a client.
+// See NewJSONFormat and MultiJSONFormat for an opinion on how to send back meta data about errors with the error data to a client.
 // JSONFormat includes a body of response data (the "data field") that is by default the data from the Error
 // serialized to JSON.
-// This package provides no help on versioning error data.
+//
+// Errors are traced via PreviousErrorCode() which shows up as the Trace field in JSONFormat
+// Stack traces are automatically added by NewInternalErr Internal errors StackTrace
 package errcode
 
 import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 // CodeStr is a representation of the type of a particular error.
@@ -220,13 +224,24 @@ func ClientData(errCode ErrorCode) interface{} {
 }
 
 // JSONFormat is an opinion on how to serialize an ErrorCode to JSON.
-// Msg is the string from Error().
-// The Data field is filled in by GetClientData
+// * Code is the error code string (CodeStr)
+// * Msg is the string from Error() and should be friendly to end users.
+// * Data is the ad-hoc data filled in by GetClientData and should be consumable by clients.
+// * Operation is the high-level operation that was happening at the time of the error.
+// The Operation field may be missing, and the Data field may be empty.
+//
+// The rest of the fields may be populated sparsely depending on the application:
+// * Previous gives JSONFormat data for an ErrorCode that was wrapped by this one. It relies on the PreviousErrorCode function.
+// * Errors is a list of additional combined parallel/sibling errors.
+// * Stack is a stack trace. Usually only internal errors populate this.
 type JSONFormat struct {
-	Data      interface{} `json:"data"`
-	Msg       string      `json:"msg"`
-	Code      CodeStr     `json:"code"`
-	Operation string      `json:"operation,omitempty"`
+	Code      CodeStr           `json:"code"`
+	Msg       string            `json:"msg"`
+	Data      interface{}       `json:"data"`
+	Operation string            `json:"operation,omitempty"`
+	Previous  *JSONFormat       `json:"previous,omitempty"`
+	Errors    []JSONFormat      `json:"errors,omitempty"`
+	Stack     errors.StackTrace `json:"stack,omitempty"`
 }
 
 // OperationClientData gives the results of both the ClientData and Operation functions.
@@ -244,12 +259,31 @@ func OperationClientData(errCode ErrorCode) (string, interface{}) {
 
 // NewJSONFormat turns an ErrorCode into a JSONFormat
 func NewJSONFormat(errCode ErrorCode) JSONFormat {
+	// Gather up multiple errors.
+	// We discard any that are not ErrorCode.
+	errorCodes := ErrorCodes(errCode)
+	additional := make([]JSONFormat, len(errorCodes)-1)
+	for i, err := range errorCodes[1:] {
+		additional[i] = NewJSONFormat(err)
+	}
+
 	op, data := OperationClientData(errCode)
+
+	prevCode := PreviousErrorCode(errCode)
+	var previous *JSONFormat
+	if prevCode != nil {
+		ptrVar := NewJSONFormat(prevCode)
+		previous = &ptrVar
+	}
+
 	return JSONFormat{
 		Data:      data,
 		Msg:       errCode.Error(),
 		Code:      errCode.Code().CodeStr(),
 		Operation: op,
+		Stack:     StackTrace(errCode),
+		Previous:  previous,
+		Errors:    additional,
 	}
 }
 
@@ -280,9 +314,15 @@ func NewCodedError(err error, code Code) CodedError {
 
 var _ ErrorCode = (*CodedError)(nil)     // assert implements interface
 var _ HasClientData = (*CodedError)(nil) // assert implements interface
+var _ HasError = (*CodedError)(nil)      // assert implements interface
 
 func (e CodedError) Error() string {
 	return e.Err.Error()
+}
+
+// GetError satisfies the HasError interface.
+func (e CodedError) GetError() error {
+	return e.Err
 }
 
 // Code returns the GetCode field
@@ -311,13 +351,14 @@ func NewInvalidInputErr(err error) ErrorCode {
 var _ ErrorCode = (*invalidInputErr)(nil)     // assert implements interface
 var _ HasClientData = (*invalidInputErr)(nil) // assert implements interface
 
-// internalError gives the code InvalidInputCode
-type internalErr struct{ CodedError }
+// internalError gives the code InternalCode
+type internalErr struct{ StackCode }
 
 // NewInternalErr creates an internalError from an err
 // If the given err is an ErrorCode that is a descendant of InternalCode,
 // its code will be used.
 // This ensures the intention of sending an HTTP 50x.
+// This function also records a stack trace.
 func NewInternalErr(err error) ErrorCode {
 	code := InternalCode
 	if errcode, ok := err.(ErrorCode); ok {
@@ -326,7 +367,7 @@ func NewInternalErr(err error) ErrorCode {
 			code = errCode
 		}
 	}
-	return internalErr{CodedError{GetCode: code, Err: err}}
+	return internalErr{NewStackCode(CodedError{GetCode: code, Err: err}, 2)}
 }
 
 var _ ErrorCode = (*internalErr)(nil)     // assert implements interface
@@ -391,6 +432,11 @@ type OpErrCode struct {
 	Err       ErrorCode
 }
 
+// GetError satisfies the HasError interface
+func (e OpErrCode) GetError() error {
+	return e.Err
+}
+
 // Error prefixes the operation to the underlying Err Error.
 func (e OpErrCode) Error() string {
 	return e.Operation + ": " + e.Err.Error()
@@ -414,6 +460,7 @@ func (e OpErrCode) GetClientData() interface{} {
 var _ ErrorCode = (*OpErrCode)(nil)     // assert implements interface
 var _ HasClientData = (*OpErrCode)(nil) // assert implements interface
 var _ HasOperation = (*OpErrCode)(nil)  // assert implements interface
+var _ HasError = (*OpErrCode)(nil)      // assert implements interface
 
 // A Modifier returns a new modified ErrorCode
 type Modifier func(ErrorCode) ErrorCode
@@ -436,6 +483,232 @@ func Op(operation string) Modifier {
 	return func(err ErrorCode) ErrorCode {
 		return OpErrCode{Operation: operation, Err: err}
 	}
+}
+
+// HasError allows the abstract retrieval of the underlying error
+// Types that wrap errors can implement this to allow viewing of the underlying error.
+// It is used for example by PreviousErrorCode and StackTrace to check if the underlying error is an ErrorCode or a StackTracer.
+//
+// If you implement a wrapper of errors you should define this interface.
+type HasError interface {
+	GetError() error
+}
+
+// WrappedError retrieves the wrapped error via HasError
+// Return nil is there is no wrapped error
+func WrappedError(err error) error {
+	if hasErr, ok := err.(HasError); ok {
+		return hasErr.GetError()
+	}
+	return nil
+}
+
+// EmbedErr is designed to be embedded into your existing error structs.
+// It provides the HasError interface already, which can reduce your boilerplate.
+type EmbedErr struct {
+	Err error
+}
+
+// GetError implements the HasError interface
+func (e EmbedErr) GetError() error {
+	return e.Err
+}
+
+var _ HasError = (*EmbedErr)(nil) // assert implements interface
+
+// PreviousErrorCode looks for a previous ErrorCode that has a different code.
+// This helps construct a trace of all previous errors.
+// It will return nil if no previous ErrorCode is found.
+//
+// To look for a previous ErrorCode it looks at HasPreviousErrorCode or HasError to see if they are an ErrorCode.
+// Wrappers of errors like OpErrCode and CodedError implement HasError.
+func PreviousErrorCode(err ErrorCode) ErrorCode {
+	return previousErrorCodeCompare(err.Code(), err)
+}
+
+func previousErrorCodeCompare(code Code, err error) ErrorCode {
+	prev := WrappedError(err)
+	if prev == nil {
+		return nil
+	}
+	if errcode, ok := prev.(ErrorCode); ok {
+		if errcode.Code() != code {
+			return errcode
+		}
+	}
+	return previousErrorCodeCompare(code, prev)
+}
+
+// StackTracer is the interface defined but not exported from pkg/errors
+// The StackTrace() function (not method) is a preferred way to access the StackTrace
+//
+// Generally you should only bother with stack traces for internal errors.
+type StackTracer interface {
+	StackTrace() errors.StackTrace
+}
+
+// StackTrace retrieves the errors.StackTrace from the error if it is present.
+// If there is not StackTrace it will return nil
+//
+// StackTrace looks to see if the error is a StackTracer of a HasError that is a StackTracer.
+func StackTrace(err error) errors.StackTrace {
+	if stackTraceErr, ok := err.(StackTracer); ok {
+		return stackTraceErr.StackTrace()
+	}
+	if hasErr, ok := err.(HasError); ok {
+		return StackTrace(hasErr.GetError())
+	}
+	return nil
+}
+
+// Stack adds a stack trace to an error code
+// Stack().Modify(code)
+func Stack() Modifier {
+	return func(err ErrorCode) ErrorCode {
+		return NewStackCode(err, 2)
+	}
+}
+
+// StackCode is an ErrorCode with stack trace information by attached.
+// This may be used as a convenience to record the strack trace information for the error.
+// Generally stack traces aren't needed for user errors, but they are provided by NewInternalErr.
+// Its also possible to define your own structures that satisfy the StackTracer interface.
+type StackCode struct {
+	Err           ErrorCode
+	GetStackTrace errors.StackTrace
+}
+
+// StackTrace fulfills the StackTracer interface
+func (e StackCode) StackTrace() errors.StackTrace {
+	return e.GetStackTrace
+}
+
+// NewStackCode constrcuts a StackCode, which is an ErrorCode with stack trace information
+// The second variable is an optional stack position gets rid of information about function calls to construct the stack trace.
+// It is defaulted to 1 to remove this function call.
+func NewStackCode(err ErrorCode, position ...int) StackCode {
+	stackPosition := 1
+	if len(position) > 0 {
+		stackPosition = position[0]
+	}
+	// if there is an existing trace, take that: it should be deeper
+	if stackTraceErr, ok := err.(StackTracer); ok {
+		return StackCode{Err: err, GetStackTrace: stackTraceErr.StackTrace()}
+	}
+	// we must go through some contortions to get a stack trace from pkg/errors
+	stackedErr := errors.WithStack(err)
+	if stackTraceErr, ok := stackedErr.(StackTracer); ok {
+		return StackCode{Err: err, GetStackTrace: stackTraceErr.StackTrace()[stackPosition:]}
+	}
+	panic("NewStackCode: pkg/errors WithStack StackTrace interface changed")
+}
+
+// GetError satisfies the HasError interface
+func (e StackCode) GetError() error {
+	return e.Err
+}
+
+// Error ignores the stack and gives the underlying Err Error.
+func (e StackCode) Error() string {
+	return e.Err.Error()
+}
+
+// Code returns the unerlying Code of Err.
+func (e StackCode) Code() Code {
+	return e.Err.Code()
+}
+
+// GetClientData returns the ClientData of the underlying Err.
+func (e StackCode) GetClientData() interface{} {
+	return ClientData(e.Err)
+}
+
+var _ ErrorCode = (*StackCode)(nil)     // assert implements interface
+var _ HasClientData = (*StackCode)(nil) // assert implements interface
+var _ HasError = (*StackCode)(nil)      // assert implements interface
+
+// ErrorGroup is the same interface as provided by uber-go/multierr
+// Other multi error packages provide similar interfaces.
+//
+// There are two concepts around multiple errors
+// * Wrapping errors (We have this already with HasError)
+// * multiple parallel/sibling errors: this is ErrorGroup
+type ErrorGroup interface {
+	Errors() []error
+}
+
+// Errors uses the ErrorGroup interface to return a slice of errors.
+// If the ErrorGroup interface is not implemented it returns an array containing just the given error.
+func Errors(err error) []error {
+	if eg, ok := err.(ErrorGroup); ok {
+		return eg.Errors()
+	}
+	return []error{err}
+}
+
+// ErrorCodes return all errors (from an ErrorGroup) that are of interface ErrorCode.
+// It first calls the Errors function.
+func ErrorCodes(err error) []ErrorCode {
+	errors := Errors(err)
+	errorCodes := make([]ErrorCode, len(errors))
+	for i, errItem := range errors {
+		if errcode, ok := errItem.(ErrorCode); ok {
+			errorCodes[i] = errcode
+		}
+	}
+	return errorCodes
+}
+
+// A MultiErrCode contains at least one ErrorCode and uses that to satisfy the ErrorCode and related interfaces
+// The Error method will produce a string of all the errors with a semi-colon separation.
+// Later code (such as a JSON response) needs to look for the ErrorGroup interface.
+type MultiErrCode struct {
+	ErrorCode ErrorCode
+	all       []error
+}
+
+// NewCombineErr once applied constructs a MultiErrCode.
+// It will combine any other MultiErrCode into just one MultiErrCode.
+func NewCombineErr(override ErrorCode) Modifier {
+	return func(original ErrorCode) ErrorCode {
+		return MultiErrCode{
+			ErrorCode: override,
+			all:       append(Errors(override), Errors(original)...),
+		}
+	}
+}
+
+var _ ErrorCode = (*MultiErrCode)(nil)     // assert implements interface
+var _ HasClientData = (*MultiErrCode)(nil) // assert implements interface
+var _ HasError = (*MultiErrCode)(nil)      // assert implements interface
+var _ ErrorGroup = (*MultiErrCode)(nil)    // assert implements interface
+
+func (e MultiErrCode) Error() string {
+	output := e.ErrorCode.Error()
+	for _, item := range e.all[1:] {
+		output += "; " + item.Error()
+	}
+	return output
+}
+
+// Errors fullfills the ErrorGroup inteface
+func (e MultiErrCode) Errors() []error {
+	return e.all
+}
+
+// Code fullfills the ErrorCode inteface
+func (e MultiErrCode) Code() Code {
+	return e.ErrorCode.Code()
+}
+
+// GetError fullfills the HasError inteface
+func (e MultiErrCode) GetError() error {
+	return e.ErrorCode
+}
+
+// GetClientData fullfills the HasClientData inteface
+func (e MultiErrCode) GetClientData() interface{} {
+	return ClientData(e.ErrorCode)
 }
 
 // checkCodePath checks that the given code string either
